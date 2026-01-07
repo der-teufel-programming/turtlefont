@@ -31,10 +31,17 @@ pub fn main() !u8 {
         var font_file = try std.fs.cwd().openFile(cli.options.font orelse @panic("missing font file parameters"), .{});
         defer font_file.close();
 
-        var font_data = std.ArrayList(u8).init(allocator);
+        var font_file_buffer: [1024]u8 = undefined;
+        var font_file_reader = font_file.reader(&font_file_buffer);
+
+        var font_data: std.Io.Writer.Allocating = .init(allocator);
         defer font_data.deinit();
 
-        try turtlefont.FontCompiler.compile(allocator, font_file.reader(), font_data.writer());
+        try turtlefont.FontCompiler.compile(
+            allocator,
+            &font_file_reader.interface,
+            &font_data.writer,
+        );
 
         const font_bits = try font_data.toOwnedSlice();
         errdefer allocator.free(font_bits);
@@ -90,7 +97,7 @@ pub fn main() !u8 {
             cfg,
         );
 
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
     return 0;

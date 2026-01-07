@@ -148,20 +148,23 @@ pub const FontCompiler = struct {
         return a.codepoint < b.codepoint;
     }
 
-    pub fn compile(allocator: std.mem.Allocator, src_stream: anytype, dst_stream: anytype) !void {
-        var buffered_reader = std.io.bufferedReader(src_stream);
-
-        const reader = buffered_reader.reader();
-
+    pub fn compile(
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+    ) !void {
         var temp_storage = std.heap.ArenaAllocator.init(allocator);
         defer temp_storage.deinit();
 
-        var list = std.ArrayList(GlyphBuffer).init(temp_storage.allocator());
-        defer list.deinit();
+        const temp_allocator = temp_storage.allocator();
+        var list: std.ArrayList(GlyphBuffer) = .empty;
+        defer list.deinit(temp_allocator);
 
         var line_buffer: [1024]u8 = undefined;
-        while (try reader.readUntilDelimiterOrEof(&line_buffer, '\n')) |raw_line| {
-            const line = std.mem.trim(u8, raw_line, "\r\n");
+        var line_writer: std.Io.Writer = .fixed(&line_buffer);
+        while ((try reader.streamDelimiterEnding(&line_writer, '\n')) > 0) {
+            defer _ = line_writer.consumeAll();
+            const line = std.mem.trim(u8, line_writer.buffered(), "\r\n");
             if (line.len == 0)
                 continue;
 
@@ -174,27 +177,24 @@ pub const FontCompiler = struct {
             if (iterator.nextCodepoint() != @as(?u21, ':'))
                 return error.InvalidFormat;
 
-            var stream_buffer = std.ArrayList(u8).init(temp_storage.allocator());
+            var stream_buffer: std.Io.Writer.Allocating = .init(temp_allocator);
             defer stream_buffer.deinit();
 
-            var glyph_buffer = GlyphBuffer{
+            var glyph_buffer: GlyphBuffer = .{
                 .codepoint = codepoint,
                 .code = undefined,
                 .offset = undefined,
                 .advance = undefined,
             };
 
-            const meta = try compileGlyphScript(line[iterator.i..], stream_buffer.writer());
+            const meta = try compileGlyphScript(line[iterator.i..], &stream_buffer.writer);
             glyph_buffer.advance = meta.advance;
             glyph_buffer.code = try stream_buffer.toOwnedSlice();
 
-            try list.append(glyph_buffer);
+            try list.append(temp_allocator, glyph_buffer);
         }
 
         std.sort.block(GlyphBuffer, list.items, {}, orderGlyphBuffer);
-
-        var buffered_writer = std.io.bufferedWriter(dst_stream);
-        const writer = buffered_writer.writer();
 
         try writer.writeInt(u32, 0x4c2b8688, .little);
         try writer.writeInt(u32, @as(u32, @intCast(list.items.len)), .little);
@@ -215,17 +215,17 @@ pub const FontCompiler = struct {
             try writer.writeAll(glyph.code);
         }
 
-        try buffered_writer.flush();
+        try writer.flush();
     }
 
     pub const GlyphScriptMeta = struct {
         advance: u8,
     };
 
-    pub fn compileGlyphScript(script: []const u8, writer: anytype) !GlyphScriptMeta {
+    pub fn compileGlyphScript(script: []const u8, writer: *std.Io.Writer) !GlyphScriptMeta {
         var meta: GlyphScriptMeta = .{ .advance = 0 };
 
-        var decoder = GlyphScriptDecoder{ .slice = script };
+        var decoder: GlyphScriptDecoder = .{ .slice = script };
         try decoder.compileCommandSequence(&meta.advance, writer);
 
         return meta;
@@ -235,39 +235,40 @@ pub const FontCompiler = struct {
         slice: []const u8,
         i: usize = 0,
 
-        fn compileCommandSequence(decoder: *GlyphScriptDecoder, advance: *u8, dst_writer: anytype) !void {
-            var buffered_writer = std.io.bufferedWriter(dst_writer);
-            const writer = buffered_writer.writer();
-
+        fn compileCommandSequence(
+            decoder: *GlyphScriptDecoder,
+            advance: *u8,
+            writer: *std.Io.Writer,
+        ) !void {
             advance.* = 0;
 
             while (try decoder.fetchCommand()) |cmd| {
                 switch (cmd) {
                     .move_rel => |val| {
-                        try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .move_rel })));
+                        try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .move_rel }));
                         try writePoint(writer, val);
                     },
                     .move_abs => |val| {
-                        try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .move_abs })));
+                        try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .move_abs }));
                         try writePoint(writer, val);
                     },
                     .line_rel => |val| {
-                        try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .line_rel })));
+                        try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .line_rel }));
                         try writePoint(writer, val);
                     },
                     .line_abs => |val| {
-                        try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .line_abs })));
+                        try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .line_abs }));
                         try writePoint(writer, val);
                     },
-                    .point => try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .point }))),
+                    .point => try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .point })),
                     .advance => |val| advance.* = val,
                 }
             }
-            try writer.writeByte(@as(u8, @bitCast(EncodedCommand{ .cmd = .end })));
-            try buffered_writer.flush();
+            try writer.writeByte(@bitCast(EncodedCommand{ .cmd = .end }));
+            try writer.flush();
         }
 
-        fn writePoint(writer: anytype, pt: Point) !void {
+        fn writePoint(writer: *std.Io.Writer, pt: Point) !void {
             try writer.writeInt(i8, pt.x, .little);
             try writer.writeInt(i8, pt.y, .little);
         }
@@ -276,13 +277,13 @@ pub const FontCompiler = struct {
             const c = decoder.fetchChar() orelse return null;
 
             return switch (c) {
-                'a' => Command{ .advance = try decoder.fetchNumber(u8) },
+                'a' => .{ .advance = try decoder.fetchNumber(u8) },
 
-                'm' => Command{ .move_rel = try decoder.fetchPoint() },
-                'M' => Command{ .move_abs = try decoder.fetchPoint() },
+                'm' => .{ .move_rel = try decoder.fetchPoint() },
+                'M' => .{ .move_abs = try decoder.fetchPoint() },
 
-                'p' => Command{ .line_rel = try decoder.fetchPoint() },
-                'P' => Command{ .line_abs = try decoder.fetchPoint() },
+                'p' => .{ .line_rel = try decoder.fetchPoint() },
+                'P' => .{ .line_abs = try decoder.fetchPoint() },
 
                 'd' => .point,
 
@@ -293,7 +294,7 @@ pub const FontCompiler = struct {
         fn fetchPoint(decoder: *GlyphScriptDecoder) !Point {
             const x = try decoder.fetchNumber(i8);
             const y = try decoder.fetchNumber(i8);
-            return Point{ .x = x, .y = y };
+            return .{ .x = x, .y = y };
         }
 
         fn fetchNumber(decoder: *GlyphScriptDecoder, comptime T: type) error{ MissingNumber, InvalidCharacter, Overflow }!T {
@@ -390,7 +391,15 @@ pub fn Rasterizer(
             }
         }
 
-        pub fn render(raster: Rast, x: i16, y: i16, string: []const u8, font: Font, color: Color, options: Options) void {
+        pub fn render(
+            raster: Rast,
+            x: i16,
+            y: i16,
+            string: []const u8,
+            font: Font,
+            color: Color,
+            options: Options,
+        ) void {
             var view = std.unicode.Utf8View.initUnchecked(string);
             var iter = view.iterator();
 
@@ -415,7 +424,14 @@ pub fn Rasterizer(
             }
         }
 
-        pub fn renderGlyph(raster: Rast, options: Options, tx: i16, ty: i16, color: Color, glyph_code: [*]const u8) void {
+        pub fn renderGlyph(
+            raster: Rast,
+            options: Options,
+            tx: i16,
+            ty: i16,
+            color: Color,
+            glyph_code: [*]const u8,
+        ) void {
             var prev = Point{ .x = 0, .y = 0 };
             var pos = Point{ .x = 0, .y = 0 };
 
@@ -474,7 +490,15 @@ pub fn Rasterizer(
             }
         };
 
-        fn line(raster: Rast, options: Options, x0: i16, y0: i16, x1: i16, y1: i16, color: Color) void {
+        fn line(
+            raster: Rast,
+            options: Options,
+            x0: i16,
+            y0: i16,
+            x1: i16,
+            y1: i16,
+            color: Color,
+        ) void {
             const dx = @as(i16, @intCast(if (x1 > x0) x1 - x0 else x0 - x1));
             const dy = -@as(i16, @intCast(if (y1 > y0) y1 - y0 else y0 - y1));
 
